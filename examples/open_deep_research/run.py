@@ -2,10 +2,16 @@ import argparse
 import json
 import os
 import threading
+import time
+from litellm import RateLimitError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List
+
+import sys
+# Assuming the project root (which contains 'smolagents') lies two directories up
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..','src')))
 
 import datasets
 import pandas as pd
@@ -75,7 +81,7 @@ append_answer_lock = threading.Lock()
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--model-id", type=str, default="o1")
+    parser.add_argument("--model-id", type=str, default="openai/gpt-4o-mini")
     parser.add_argument("--api-base", type=str, default=None)
     parser.add_argument("--run-name", type=str, required=True)
     return parser.parse_args()
@@ -93,18 +99,30 @@ custom_role_conversions = {"tool-call": "assistant", "tool-response": "user"}
 
 ### LOAD EVALUATION DATASET
 
-eval_ds = datasets.load_dataset("gaia-benchmark/GAIA", "2023_all")[SET]
-eval_ds = eval_ds.rename_columns({"Question": "question", "Final answer": "true_answer", "Level": "task"})
+# Load your custom research questions from the CSV file
+eval_df = pd.read_csv("my_research_questions.csv")
+
+# Rename the columns to match expected names
+eval_df = eval_df.rename(columns={
+    "Question": "question",
+    "Final answer": "true_answer",  # if you later add expected answers, leave empty if not used
+    "Level": "task"
+})
+
+eval_df["file_name"].fillna("", inplace=True)
+
+#eval_ds = datasets.load_dataset("gaia-benchmark/GAIA", "2023_all")[SET]
+#eval_ds = eval_ds.rename_columns({"Question": "question", "Final answer": "true_answer", "Level": "task"})
 
 
-def preprocess_file_paths(row):
-    if len(row["file_name"]) > 0:
-        row["file_name"] = f"data/gaia/{SET}/" + row["file_name"]
-    return row
+#def preprocess_file_paths(row):
+#    if len(row["file_name"]) > 0:
+#        row["file_name"] = f"data/gaia/{SET}/" + row["file_name"]
+#    return row
 
 
-eval_ds = eval_ds.map(preprocess_file_paths)
-eval_df = pd.DataFrame(eval_ds)
+#eval_df = eval_df.map(preprocess_file_paths)
+#eval_df = pd.DataFrame(eval_df)
 print("Loaded evaluation dataset:")
 print(eval_df["task"].value_counts())
 
@@ -185,7 +203,7 @@ def answer_single_question(example, model_id, answers_file, visual_inspection_to
         model_id,
         custom_role_conversions=custom_role_conversions,
         max_completion_tokens=8192,
-        reasoning_effort="high",
+        #reasoning_effort="high",
     )
     # model = HfApiModel("Qwen/Qwen2.5-72B-Instruct", provider="together")
     #     "https://lnxyuvj02bpe6mam.us-east-1.aws.endpoints.huggingface.cloud",
@@ -197,11 +215,9 @@ def answer_single_question(example, model_id, answers_file, visual_inspection_to
 
     agent = create_agent_hierarchy(model)
 
-    augmented_question = """You have one question to answer. It is paramount that you provide a correct answer.
-Give it all you can: I know for a fact that you have access to all the relevant tools to solve it and find the correct answer (the answer does exist). Failure or 'I cannot answer' or 'None found' will not be tolerated, success will be rewarded.
-Run verification steps if that's needed, you must make sure you find the correct answer!
-Here is the task:
-""" + example["question"]
+    augmented_question = """You have one question to answer. Please provide your best and most accurate answer 
+    using all available tools. If needed, run any verification steps to ensure the response is correct. Here 
+    is the task: """ + example["question"]
 
     if example["file_name"]:
         if ".zip" in example["file_name"]:
@@ -258,13 +274,39 @@ Here is the task:
         "start_time": start_time,
         "end_time": end_time,
         "task": example["task"],
-        "task_id": example["task_id"],
+        "task_id": example.get("task_id", example.get("task", "default-task-id")),
         "true_answer": example["true_answer"],
     }
+
+    messages = [{"role": "user", "content": augmented_question}]
+    max_retries = 5
+    base_wait = 2.0  # seconds
+    for attempt in range(max_retries):
+        try:
+            response = model(messages)
+            
+            if hasattr(response, "content"): serialized_response = response.content 
+            elif hasattr(response, "to_dict"): serialized_response = response.to_dict() 
+            else: serialized_response = str(response)
+            annotated_example["response"] = serialized_response
+            break
+
+        except RateLimitError as e:
+            error_detail = e.args[0] if e.args else {}
+            suggested_wait = error_detail.get("retry_after") if isinstance(error_detail, dict) else None
+            wait_time = suggested_wait if suggested_wait is not None else base_wait * (2 ** attempt)
+            print(f"Rate limit hit. Waiting for {wait_time} seconds (attempt {attempt+1}/{max_retries})...")
+            time.sleep(wait_time)
+    else:
+        raise Exception("Exceeded maximum retry attempts due to rate limiting.")
+    
+    # Optionally, incorporate 'response' into annotated_example if needed.
+    annotated_example["response"] = response
+
     append_answer(annotated_example, answers_file)
 
 
-def get_examples_to_answer(answers_file, eval_ds) -> List[dict]:
+def get_examples_to_answer(answers_file, eval_df) -> List[dict]:
     print(f"Loading answers from {answers_file}...")
     try:
         done_questions = pd.read_json(answers_file, lines=True)["question"].tolist()
@@ -273,7 +315,7 @@ def get_examples_to_answer(answers_file, eval_ds) -> List[dict]:
         print("Error when loading records: ", e)
         print("No usable records! ▶️ Starting new.")
         done_questions = []
-    return [line for line in eval_ds.to_list() if line["question"] not in done_questions]
+    return [line for line in eval_df.to_dict(orient="records") if line["question"] not in done_questions]
 
 
 def main():
@@ -281,7 +323,7 @@ def main():
     print(f"Starting run with arguments: {args}")
 
     answers_file = f"output/{SET}/{args.run_name}.jsonl"
-    tasks_to_run = get_examples_to_answer(answers_file, eval_ds)
+    tasks_to_run = get_examples_to_answer(answers_file, eval_df)
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as exe:
         futures = [
